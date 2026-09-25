@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+!.env.example
+evolution_result_*.json
+submission_*.py

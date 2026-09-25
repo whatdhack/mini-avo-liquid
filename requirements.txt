@@ -1,0 +1,4 @@
+openai>=1.0
+triton>=3.6        # GPU-less compile check + static score (no GPU needed)
+torch>=2.11        # optional: only imported by kernels' host wrappers, never run here
+pillow             # optional: only for assets/make_demo_gif.py
