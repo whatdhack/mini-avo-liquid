@@ -2,7 +2,7 @@
 
 **GPU-less evolutionary search for Triton kernels, driven by a small Liquid AI model.**
 
-![MiniAVO-Liquid loop: a parent kernel is mutated by the Liquid model into candidate kernels, which are filtered by a Python syntax check and an ahead-of-time Triton compile, scored statically, and the best becomes the next parent](assets/demo.gif)
+![MiniAVO-Liquid loop: a parent kernel is mutated by the Liquid model into candidate kernels, which are filtered by a Python syntax check and an ahead-of-time Triton compile, scored statically, and the best becomes the next parent; what the checks found is turned into instructions for the next generation's prompt](assets/demo.gif)
 
 ## What it does
 
@@ -17,7 +17,12 @@ MiniAVO-Liquid runs an evolutionary loop over GPU kernels for
 3. **Check.** Each candidate must parse as Python and compile as Triton for the target GPU.
 4. **Score.** Candidates that compile get a static performance score.
 5. **Select.** A candidate becomes the new parent only if it scores strictly higher than the
-   current one. The loop repeats for `--generations` rounds.
+   current one.
+6. **Feed back.** What the checks and the static analysis found becomes instructions in the next
+   generation's prompt. These lessons are kept for the current run, or across runs in RawTree
+   (`--feedback-memory rawtree`).
+
+The loop repeats for `--generations` rounds.
 
 Everything is written to a lineage JSON (every candidate, including failed ones and why they
 failed) and a submission script containing the best kernel.
@@ -61,6 +66,36 @@ for selection.
 
 **Safety:** kernels are model output, so their top-level code is never executed. Only
 trusted imports, function definitions and literal constants are loaded before compiling.
+
+### Feedback to the next generation
+
+What the checks find is turned into instructions for the next prompt (`feedback.py`):
+
+- **Rejected candidates** become rules. For example, a made-up `tl.*` name gets its Triton
+  replacement (`tl.ceil_div` → `tl.cdiv`; no manual shared-memory allocation), C syntax gets
+  "write Python, not C", a function defined inside a kernel gets "move helpers to module
+  level", and a reply cut off at the token limit gets "return only the kernel".
+- **Near misses** are reported: a candidate that compiled but didn't beat the parent is told
+  which score components it lost on.
+- **The parent's weak spots** from static analysis are listed as opportunities, such as narrow
+  loads, no TMA, no warp specialization, spills or small tiles.
+
+Repeated mistakes are merged with a "seen N×" count, and only the most recent few are kept.
+
+**Feedback memory.** With `--feedback-memory local` (the default), lessons last for one run.
+With `--feedback-memory rawtree`, every lesson and candidate outcome is also written as an event
+to a [RawTree](https://rawtree.com) table (Tinybird's analytics database for unstructured data; the
+table is created on first insert). The next run on the same problem and hardware loads those
+lessons back with SQL, so it starts out knowing the mistakes earlier runs made. The same table
+can be queried for analysis across runs, for example:
+
+```sql
+SELECT status, count() FROM miniavo_feedback
+WHERE kind = 'candidate' AND problem = 'matmul_v2' GROUP BY status
+```
+
+If RawTree is unreachable or the key is wrong, the run prints one warning and continues with
+in-memory feedback.
 
 ### Generation fan-out (planned)
 
@@ -110,6 +145,7 @@ cp .env.example .env
 |---|---|
 | `OPENROUTER_API_KEY` | Liquid model mutations. Without it, each generation uses a deterministic simulator. |
 | `NIMBLE_API_KEY` | `--web-seed` only |
+| `RAWTREE_API_KEY` (+ optional `RAWTREE_DATABASE`, `RAWTREE_FEEDBACK_TABLE`) | `--feedback-memory rawtree` only; the key needs `read_write` permission |
 | `LIQUID_MODEL`, `LIQUID_MAX_TOKENS`, `LIQUID_REASONING_EFFORT` | Optional overrides (defaults: `liquid/lfm-2.5-2.6b:free`, `8192`, `high`) |
 
 ### 3. Run
@@ -124,6 +160,9 @@ python run_evolution.py --problem matmul_v2 --hardware b200 --web-seed --generat
 # Search the web again instead of using the cached seed in seeds/web/
 python run_evolution.py --problem matmul_v2 --web-seed --refresh-seed
 
+# Keep check-derived lessons across runs in RawTree
+python run_evolution.py --problem vectorsum_v2 --hardware h100 --feedback-memory rawtree
+
 # Steer the mutations, or pick another model
 python run_evolution.py --problem matmul_v2 --steer "Use TMA descriptors and warp specialization"
 python run_evolution.py --model liquid/lfm-2.5-1.2b-instruct:free
@@ -137,6 +176,7 @@ python run_evolution.py --model liquid/lfm-2.5-1.2b-instruct:free
 | `--web-seed` / `--refresh-seed` | start from a Nimble-found kernel / ignore the cache | off |
 | `--steer` | free-text guidance added to the mutation prompt | none |
 | `--model` | any OpenRouter model ID | `liquid/lfm-2.5-2.6b:free` |
+| `--feedback-memory` | `local` (this run only) or `rawtree` (persisted across runs) | `local` |
 
 ### 4. Read the output
 
@@ -161,6 +201,8 @@ Files written to the current directory:
 | `run_evolution.py` | CLI and evolution loop, Liquid/OpenRouter client, problem and hardware catalog |
 | `triton_check.py` | Safe loading plus ahead-of-time Triton compile for the target GPU |
 | `static_perf.py` | Static metrics (PTX / cubin / metadata) and the 0–100 score |
+| `feedback.py` | Turns check and static-analysis findings into instructions for the next prompt |
+| `rawtree_store.py` | Optional RawTree backend that persists feedback memory across runs |
 | `seed_search.py` | Nimble web search for seed kernels; slices out each `@triton.jit` kernel with its helpers |
 | `seeds/naive/` | Built-in starter kernels, one `.py` per problem |
 | `seeds/web/` | Cached web seeds (`--web-seed`) |

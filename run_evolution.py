@@ -176,6 +176,8 @@ class KernelVariant:
     check_error: Optional[str] = None  # Python syntax, Triton compile or launch-limit error
     static: Dict[str, Any] = field(default_factory=dict)  # static_perf.analyze() metrics
     static_score: Optional[float] = None  # 0-100 GPU-less proxy used for elite selection
+    agent_error: Optional[str] = None  # why the Liquid call produced no usable reply (simulator fallback)
+    prompt_feedback: str = ""  # check-derived instructions that were added to this generation's prompt
 
 # ---------------------------------------------------------------------------
 # 4. Agentic Variation Operator (Liquid AI via OpenRouter, or Heuristic Simulator)
@@ -257,6 +259,8 @@ def call_liquid_agent(prompt: str, model: str) -> Dict[str, Any]:
         reasoning_tokens = getattr(details, "reasoning_tokens", None) if details else None
         print(f"    [tokens] prompt={usage.prompt_tokens} completion={usage.completion_tokens} "
               f"reasoning={reasoning_tokens} finish={resp.choices[0].finish_reason}")
+    if resp.choices[0].finish_reason == "length":
+        raise ValueError("reply truncated at the output-token limit (finish_reason=length)")
     content = resp.choices[0].message.content or ""
     if not content.strip():
         raise ValueError(f"empty completion (finish_reason={resp.choices[0].finish_reason})")
@@ -268,8 +272,10 @@ def mutate_kernel_with_agent(
     parent: KernelVariant,
     generation_idx: int,
     user_guidance: str = "",
-    model: str = DEFAULT_LIQUID_MODEL
+    model: str = DEFAULT_LIQUID_MODEL,
+    feedback: str = ""
 ) -> KernelVariant:
+    agent_error = None
     # If an OpenRouter API key is available, use the real Liquid AI agent mutation
     if os.getenv("OPENROUTER_API_KEY"):
         try:
@@ -284,6 +290,8 @@ def mutate_kernel_with_agent(
             ```
 
             Optimization Guidance: {user_guidance or 'Apply advanced micro-architectural optimizations to maximize hardware utilization.'}
+
+            {feedback}
 
             Return a JSON response with:
             {{
@@ -317,7 +325,8 @@ def mutate_kernel_with_agent(
                     id=variant_id, name=variant_name, generation=generation_idx, parent_id=parent.id,
                     optimization_type=opt_type, description=description,
                     latency_us=0.0, speedup=0.0, status="failed", telemetry={},
-                    code=code, verification_error=0.0, check_error=check_error, static=static
+                    code=code, verification_error=0.0, check_error=check_error, static=static,
+                    prompt_feedback=feedback
                 )
 
             speedup = round(problem.baseline_latency_us / new_lat, 2)
@@ -337,9 +346,11 @@ def mutate_kernel_with_agent(
                 code=code,
                 verification_error=1.4e-4,
                 static=static,
-                static_score=static.get("score")
+                static_score=static.get("score"),
+                prompt_feedback=feedback
             )
         except Exception as e:
+            agent_error = str(e)
             print(f"[!] Liquid agent ({model}) fallback to analytical engine: {e}")
 
     # Deterministic Analytical Evolutionary Simulation fallback (no API key required)
@@ -368,7 +379,9 @@ def mutate_kernel_with_agent(
         code=mutated_code,
         verification_error=2.1e-4,
         static=parent.static,  # only comment lines were added, so the compiled kernel is unchanged
-        static_score=parent.static_score
+        static_score=parent.static_score,
+        agent_error=agent_error,
+        prompt_feedback=feedback
     )
 
 def analyze_kernel(code: str, problem: BenchmarkProblem, hw: HardwareProfile):
@@ -387,7 +400,7 @@ def is_better(candidate: KernelVariant, elite: KernelVariant) -> bool:
 # ---------------------------------------------------------------------------
 
 def run_evolution_pipeline(problem_id: str, hardware_id: str, generations: int, steer_prompt: str = "", model: str = DEFAULT_LIQUID_MODEL,
-                           web_seed: bool = False, refresh_seed: bool = False):
+                           web_seed: bool = False, refresh_seed: bool = False, feedback_memory: str = "local"):
     hw = HARDWARE_CATALOG.get(hardware_id, HARDWARE_CATALOG["b200"])
     problem = PROBLEMS.get(problem_id, PROBLEMS["matmul_v2"])
     seed_source = None
@@ -434,6 +447,21 @@ def run_evolution_pipeline(problem_id: str, hardware_id: str, generations: int, 
 
     lineage: List[KernelVariant] = [root_variant]
     current_elite = root_variant
+    from feedback import Feedback
+    from triton_check import HW_CAPABILITY
+    from static_perf import GEMM_PROBLEMS
+    store = None
+    if feedback_memory == "rawtree":
+        from rawtree_store import RawTreeError, RawTreeStore
+        try:
+            store = RawTreeStore.from_env()
+        except RawTreeError as e:
+            print(f"[!] RawTree feedback memory unavailable, using in-memory feedback: {e}")
+    feedback = Feedback(gemm=problem.id in GEMM_PROBLEMS, capability=HW_CAPABILITY.get(hw.id, 90), store=store,
+                        context={"problem": problem.id, "hardware": hw.id, "model": model})
+    if store is not None and store.enabled:
+        print(f"[*] Feedback memory: RawTree table '{store.table}' (run {store.run_id}), "
+              f"{feedback.loaded_from_memory} lesson(s) loaded from earlier runs\n")
 
     print(f"[*] [Gen 0] Baseline Seed: {root_variant.name} | Reference latency: {root_variant.latency_us} μs (problem table)")
     if seed_error:
@@ -445,21 +473,27 @@ def run_evolution_pipeline(problem_id: str, hardware_id: str, generations: int, 
         print(f"[>] Evolving Generation {gen}/{generations} via Agentic Variation Operator...")
         time.sleep(0.4) # visual pacing
 
+        prompt_feedback = feedback.render(current_elite)
+        if prompt_feedback:
+            n_rules = sum(1 for line in prompt_feedback.splitlines() if line.startswith("- "))
+            print(f"    [feedback] {n_rules} check-derived instruction(s) added to the prompt")
+        parent = current_elite
         new_variant = mutate_kernel_with_agent(
             problem=problem,
             hw=hw,
-            parent=current_elite,
+            parent=parent,
             generation_idx=gen,
             user_guidance=steer_prompt,
-            model=model
+            model=model,
+            feedback=prompt_feedback
         )
-
         lineage.append(new_variant)
         if new_variant.status == "failed":
             print(f"    ├─ [✗ FAILED] {new_variant.name} ({new_variant.optimization_type})")
             print(f"    │  Rationale : {new_variant.description}")
             print(f"    │  Check     : {new_variant.check_error}")
             print(f"    │  Elite kept: {current_elite.name}\n")
+            feedback.observe(new_variant, parent)
             continue
         if is_better(new_variant, current_elite):
             current_elite = new_variant
@@ -468,6 +502,7 @@ def run_evolution_pipeline(problem_id: str, hardware_id: str, generations: int, 
         else:
             new_variant.status = "success"
             badge = "✓ COMPILES, NOT BETTER"
+        feedback.observe(new_variant, parent)
 
         print(f"    ├─ [{badge}] {new_variant.name} ({new_variant.optimization_type})")
         print(f"    │  Rationale : {new_variant.description}")
@@ -513,8 +548,10 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default=os.getenv("LIQUID_MODEL", DEFAULT_LIQUID_MODEL), help="OpenRouter model ID for the mutation agent")
     parser.add_argument("--web-seed", action="store_true", help="Search the web (Nimble) for a better initial seed kernel")
     parser.add_argument("--refresh-seed", action="store_true", help="Ignore the cached web seed and search again")
+    parser.add_argument("--feedback-memory", choices=["local", "rawtree"], default=os.getenv("FEEDBACK_MEMORY", "local"),
+                        help="Where check-derived lessons are kept: this run only, or persisted in RawTree across runs")
     parser.add_argument("--steer", type=str, default="", help="Natural language steering prompt for kernel mutations")
 
     args = parser.parse_args()
     run_evolution_pipeline(args.problem, args.hardware, args.generations, args.steer, args.model,
-                           args.web_seed, args.refresh_seed)
+                           args.web_seed, args.refresh_seed, args.feedback_memory)
