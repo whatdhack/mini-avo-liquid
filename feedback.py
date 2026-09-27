@@ -9,9 +9,11 @@ Three sources feed the prompt:
 Lessons are deduplicated and the most recent ones are kept, so repeated mistakes are called out once
 with a repeat count.
 
-Memory backends: by default lessons live only for the current run. With a store (rawtree_store.RawTreeStore)
-every lesson and candidate outcome is also persisted, and lessons from earlier runs on the same problem and
-hardware seed the first prompt.
+Memory backends: by default lessons live only for the current run. With a store
+(local_store.LocalStore or rawtree_store.RawTreeStore) every lesson and candidate outcome is also
+persisted, and both the lessons and the real-GPU timings from earlier runs on the same problem and
+hardware seed the first prompt: a measurement is the one thing a later run cannot recompute from
+the code, so what was already timed, and what it cost, is carried forward.
 """
 import re
 from collections import OrderedDict
@@ -162,7 +164,7 @@ def opportunities(static: Dict[str, Any], gemm: bool, capability: int) -> List[s
 class Feedback:
     """Accumulates lessons across generations and renders them for the next prompt."""
 
-    def __init__(self, gemm: bool, capability: int, max_lessons: int = 8,
+    def __init__(self, gemm: bool, capability: int, max_lessons: int = 8, max_measured: int = 6,
                  store: Any = None, context: Optional[Dict[str, Any]] = None):
         self.gemm = gemm
         self.capability = capability
@@ -171,12 +173,18 @@ class Feedback:
         self.context = context or {}  # problem / hardware / model, attached to every stored event
         self._lessons: "OrderedDict[str, int]" = OrderedDict()  # lesson -> times seen (most recent last)
         self._last_near_miss: Optional[str] = None
+        self._measured: List[Dict[str, Any]] = []  # real-GPU outcomes from earlier runs
+        self._measured_this_run: Dict[str, Dict[str, Any]] = {}  # and from this one, by kernel name
         self.loaded_from_memory = 0
+        self.measured_from_memory = 0
         if store is not None:
-            for lesson, n in store.load_lessons(self.context.get("problem", ""), self.context.get("hardware", ""),
-                                                limit=max_lessons):
+            problem, hardware = self.context.get("problem", ""), self.context.get("hardware", "")
+            for lesson, n in store.load_lessons(problem, hardware, limit=max_lessons):
                 self._lessons[lesson] = n
             self.loaded_from_memory = len(self._lessons)
+            if hasattr(store, "load_benchmarks"):
+                self._measured = store.load_benchmarks(problem, hardware, limit=max_measured)
+            self.measured_from_memory = len(self._measured)
 
     def _add(self, lesson: str, generation: Optional[int] = None) -> None:
         self._lessons[lesson] = self._lessons.pop(lesson, 0) + 1
@@ -185,16 +193,52 @@ class Feedback:
         if self.store is not None:
             self.store.record("lesson", self.context, generation=generation, lesson=lesson)
 
+    def observe_seed(self, variant: Any) -> None:
+        """Record the seed's own GPU timing. It is the number every candidate has to beat, so it
+        belongs in memory even though the seed is not a candidate and has no parent."""
+        if not getattr(variant, "bench_status", ""):
+            return
+        self._measured_this_run[variant.name] = {
+            "name": variant.name, "optimization_type": variant.optimization_type,
+            "latency_us": getattr(variant, "measured_latency_us", None), "bench_status": variant.bench_status}
+        if self.store is not None:
+            self.store.record("candidate", self.context, generation=0, name=variant.name,
+                              status=variant.status, optimization_type=variant.optimization_type,
+                              static_score=variant.static_score,
+                              measured_latency_us=getattr(variant, "measured_latency_us", None),
+                              bench_status=variant.bench_status)
+
     def observe(self, variant: Any, parent: Any) -> None:
         """Record what the checks found for `variant`, which was generated from `parent`."""
         if self.store is not None:
             self.store.record("candidate", self.context, generation=variant.generation, name=variant.name,
-                              status=variant.status, check_error=variant.check_error or "",
+                              status=variant.status, optimization_type=variant.optimization_type,
+                              check_error=variant.check_error or "",
                               agent_error=variant.agent_error or "", static_score=variant.static_score,
-                              parent_score=parent.static_score)
+                              parent_score=parent.static_score,
+                              measured_latency_us=getattr(variant, "measured_latency_us", None),
+                              bench_status=getattr(variant, "bench_status", ""))
         if variant.status == "failed" or variant.agent_error:
             for lesson in lessons_from_failure(variant.check_error, variant.agent_error, variant.code):
                 self._add(lesson, variant.generation)
+            return
+        bench_status = getattr(variant, "bench_status", "")
+        if bench_status:
+            self._measured_this_run[variant.name] = {
+                "name": variant.name, "optimization_type": variant.optimization_type,
+                "latency_us": getattr(variant, "measured_latency_us", None), "bench_status": bench_status}
+        if bench_status not in ("", "ok"):
+            # It compiled and scored well, and was still wrong or unrunnable on the real GPU
+            self._add(f"A kernel that passed every static check was rejected when run on the GPU: {bench_status}. "
+                      "Cover the whole input exactly once, zero-initialise any buffer you accumulate into, "
+                      "and make the host wrapper return the final result.", variant.generation)
+            return
+        measured, parent_measured = (getattr(variant, "measured_latency_us", None),
+                                     getattr(parent, "measured_latency_us", None))
+        if measured is not None and parent_measured is not None and measured >= parent_measured:
+            self._last_near_miss = (f"Your previous kernel was timed on the real GPU at {measured} μs versus the "
+                                    f"parent's {parent_measured} μs, so it was not kept. The static score cannot "
+                                    f"separate these two; change the memory access pattern, not the block size alone.")
             return
         if variant.static_score is not None and parent.static_score is not None \
                 and variant.static_score <= parent.static_score and variant.code != parent.code:
@@ -205,6 +249,29 @@ class Feedback:
                                     + (f" (lower on: {', '.join(worse)})" if worse else " (no component improved)")
                                     + ". Change something that raises a missing score component.")
 
+    def _measured_section(self) -> str:
+        """What has actually been timed on this GPU, from earlier runs and this one."""
+        rows: Dict[str, Dict[str, Any]] = {r["name"]: r for r in self._measured}
+        rows.update(self._measured_this_run)  # this run's result wins for the same kernel name
+        timed = sorted((r for r in rows.values() if r.get("latency_us")), key=lambda r: r["latency_us"])
+        rejected = [r for r in rows.values() if not r.get("latency_us") and r.get("bench_status") not in ("", "ok")]
+        if not timed and not rejected:
+            return ""
+        lines = []
+        for r in timed[:6]:
+            strategy = f" [{r['optimization_type']}]" if r.get("optimization_type") else ""
+            lines.append(f"- {r['latency_us']} μs: {r['name']}{strategy}")
+        for r in rejected[:3]:
+            strategy = f" [{r['optimization_type']}]" if r.get("optimization_type") else ""
+            lines.append(f"- wrong or unrunnable on the GPU: {r['name']}{strategy} — {r['bench_status']}")
+        header = ("Real GPU measurements from this and earlier runs (median wall-clock, lower is better; "
+                  "these are timings, not estimates):")
+        footer = (f"\nThe kernel to beat ran in {timed[0]['latency_us']} μs. The strategies listed above have "
+                  f"already been measured at that speed or slower, so a variation of them will not win: "
+                  f"change the memory access pattern or the amount of work per program."
+                  if timed else "")
+        return header + "\n" + "\n".join(lines) + footer
+
     def render(self, parent: Any) -> str:
         sections = []
         if self._lessons:
@@ -213,6 +280,9 @@ class Feedback:
                 rules.append(f"- {VALID_TL_HINT}")
             sections.append("Compiler feedback from previous generations (these mistakes were rejected; do not repeat them):\n"
                             + "\n".join(rules))
+        measured = self._measured_section()
+        if measured:
+            sections.append(measured)
         if self._last_near_miss:
             sections.append(self._last_near_miss)
         ops = opportunities(parent.static, self.gemm, self.capability)

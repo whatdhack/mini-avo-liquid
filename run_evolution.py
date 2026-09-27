@@ -35,6 +35,19 @@ HARDWARE_CATALOG: Dict[str, HardwareProfile] = {
         shared_mem_per_sm_kb=228.0,
         num_sms=160
     ),
+    "gb10": HardwareProfile(
+        id="gb10",
+        name="NVIDIA GB10 (DGX Spark)",
+        architecture="Blackwell (SM121)",
+        # 1 PFLOP FP4 sparse -> 125 TFLOPS dense FP16; FP32 from 48 SMs x 128 cores at ~1.9 GHz
+        peak_fp16_tflops=125.0,
+        peak_fp32_tflops=23.0,
+        # 273 GB/s LPDDR5X spec; a 400 MB Triton read stream measures 244 GB/s on this box
+        memory_bandwidth_gbs=273.0,
+        l2_cache_mb=24.0,
+        shared_mem_per_sm_kb=100.0,
+        num_sms=48
+    ),
     "h100": HardwareProfile(
         id="h100",
         name="NVIDIA H100 SXM5",
@@ -143,6 +156,19 @@ PROBLEMS: Dict[str, BenchmarkProblem] = {
         baseline_latency_us=185.0,
         seed_code=load_naive_seed("vectorsum_v2")
     ),
+    "cholesky": BenchmarkProblem(
+        id="cholesky",
+        name="Batched Dense Cholesky Factorization",
+        category="Linear Algebra",
+        description=("Factor batch=64 symmetric positive definite FP32 matrices of n=256 into lower-triangular L "
+                     "with A = L @ L.T (GPU MODE cholesky leaderboard, benchmark spec batch=64 n=256 cond=2). "
+                     "The seed is unblocked with one kernel launch per column; fast implementations are blocked "
+                     "(panel factorization, triangular solve, trailing SYRK update)."),
+        flop_count=64 * 256 ** 3 // 3,
+        bytes_accessed=2 * 64 * 256 * 256 * 4,  # read A, write L
+        baseline_latency_us=2229.3,  # measured on the GB10; torch.linalg.cholesky_ex is 670.7 us
+        seed_code=load_naive_seed("cholesky")
+    ),
     "trimul_alphafold3": BenchmarkProblem(
         id="trimul_alphafold3",
         name="Triangle Multiplication (AlphaFold 3)",
@@ -176,19 +202,125 @@ class KernelVariant:
     check_error: Optional[str] = None  # Python syntax, Triton compile or launch-limit error
     static: Dict[str, Any] = field(default_factory=dict)  # static_perf.analyze() metrics
     static_score: Optional[float] = None  # 0-100 GPU-less proxy used for elite selection
+    measured_latency_us: Optional[float] = None  # median wall-clock on a real GPU, when benchmarked
+    measured_speedup: Optional[float] = None  # versus the measured baseline, not the problem table
+    bench_status: str = ""  # "", "ok", or why the GPU run produced no timing
+    bench_entry: Optional[str] = None  # host wrapper the harness called
     agent_error: Optional[str] = None  # why the Liquid call produced no usable reply (simulator fallback)
     prompt_feedback: str = ""  # check-derived instructions that were added to this generation's prompt
 
 # ---------------------------------------------------------------------------
-# 4. Agentic Variation Operator (Liquid AI via OpenRouter, or Heuristic Simulator)
+# 4. Agentic Variation Operator (OpenAI-compatible LLM, or Heuristic Simulator)
 # ---------------------------------------------------------------------------
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+VULTR_BASE_URL = "https://api.vultrinference.com/v1"
 # Largest free Liquid AI model on OpenRouter (https://openrouter.ai/liquid)
 DEFAULT_LIQUID_MODEL = "liquid/lfm-2.5-2.6b:free"
 # lfm-2.5-2.6b allows at most 8192 output tokens, and hidden reasoning counts toward that limit
 DEFAULT_MAX_TOKENS = 8192
 DEFAULT_REASONING_EFFORT = "high"
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    """An OpenAI-compatible chat endpoint the mutation agent can be pointed at."""
+    id: str
+    label: str
+    base_url: str
+    key_envs: tuple            # checked in order; the first one set wins
+    default_model: str
+    model_envs: tuple          # per-provider model override env vars
+    default_max_tokens: int = DEFAULT_MAX_TOKENS
+    extra_headers: Dict[str, str] = field(default_factory=dict)
+    # How this endpoint spells the thinking budget: "" (unsupported),
+    # "openrouter" ({"reasoning": {"effort": ...}}) or "openai" (reasoning_effort)
+    reasoning_param: str = ""
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
+    reasoning_envs: tuple = ()
+
+PROVIDERS: Dict[str, ProviderSpec] = {
+    "openrouter": ProviderSpec(
+        id="openrouter",
+        label="OpenRouter",
+        base_url=OPENROUTER_BASE_URL,
+        key_envs=("OPENROUTER_API_KEY",),
+        default_model=DEFAULT_LIQUID_MODEL,
+        model_envs=("LIQUID_MODEL",),
+        extra_headers={"X-Title": "MiniAVO-Liquid"},
+        reasoning_param="openrouter",
+        reasoning_effort=DEFAULT_REASONING_EFFORT,
+        reasoning_envs=("LIQUID_REASONING_EFFORT", "LLM_REASONING_EFFORT"),
+    ),
+    "vultr": ProviderSpec(
+        id="vultr",
+        label="Vultr Serverless Inference",
+        base_url=VULTR_BASE_URL,
+        # Vultr's own docs use the first name; the shorter ones are accepted too
+        key_envs=("VULTR_SERVERLESS_INFERENCE_API_KEY", "VULTR_INFERENCE_API_KEY", "VULTR_API_KEY"),
+        # Catalog: GET https://api.vultrinference.com/v1/models (also `--list-models vultr`)
+        default_model="glm-5.3",
+        model_envs=("VULTR_MODEL",),
+        # glm-5.3 is a thinking model; on the mutation prompt it burns 32k reasoning tokens at the
+        # default effort and never emits the JSON, so ask for a low thinking budget and leave headroom
+        default_max_tokens=32768,
+        reasoning_param="openai",
+        reasoning_effort="low",
+        reasoning_envs=("VULTR_REASONING_EFFORT", "LLM_REASONING_EFFORT"),
+    ),
+}
+# Auto-detection order when --provider is not given
+PROVIDER_ORDER = ("openrouter", "vultr")
+
+def provider_api_key(spec: ProviderSpec) -> Optional[str]:
+    for env in spec.key_envs:
+        value = os.getenv(env)
+        if value:
+            return value
+    return None
+
+def provider_model(spec: ProviderSpec) -> str:
+    """Model ID for this provider: its env override if set, else its default."""
+    for env in spec.model_envs:
+        value = os.getenv(env)
+        if value:
+            return value
+    return spec.default_model
+
+def provider_reasoning_effort(spec: ProviderSpec) -> str:
+    for env in spec.reasoning_envs:
+        value = os.getenv(env)
+        if value:
+            return value
+    return spec.reasoning_effort
+
+def resolve_provider(requested: str = "") -> tuple:
+    """Return (spec, reason). spec is None when no usable provider was found;
+    reason then says why, for the simulator-fallback message."""
+    requested = requested or os.getenv("LLM_PROVIDER", "")
+    if requested:
+        spec = PROVIDERS.get(requested)
+        if spec is None:
+            raise ValueError(f"unknown provider {requested!r} (choices: {', '.join(PROVIDERS)})")
+        if provider_api_key(spec) is None:
+            return None, f"{spec.label} selected but none of {'/'.join(spec.key_envs)} is set"
+        return spec, ""
+    for pid in PROVIDER_ORDER:
+        spec = PROVIDERS[pid]
+        if provider_api_key(spec) is not None:
+            return spec, ""
+    keys = ", ".join(PROVIDERS[p].key_envs[0] for p in PROVIDER_ORDER)
+    return None, f"no inference API key set ({keys})"
+
+def list_provider_models(spec: ProviderSpec) -> List[str]:
+    """Model IDs advertised by the provider's /models endpoint."""
+    import urllib.request
+    req = urllib.request.Request(f"{spec.base_url}/models", headers=dict(spec.extra_headers))
+    key = provider_api_key(spec)
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        payload = json.load(resp)
+    return sorted(str(m.get("id")) for m in payload.get("data", []) if m.get("id"))
 
 MUTATION_STRATEGIES = [
     ("tile_tuning", "Tuned block sizes (BLOCK_M=128, BLOCK_N=256, BLOCK_K=64, num_warps=8, num_stages=4) to saturate SM register files"),
@@ -236,23 +368,38 @@ def check_syntax(code: str) -> Optional[str]:
     except SyntaxError as e:
         return f"line {e.lineno}: {e.msg}: {(e.text or '').strip()}"
 
-def call_liquid_agent(prompt: str, model: str) -> Dict[str, Any]:
-    from openai import OpenAI, BadRequestError
+def call_mutation_agent(prompt: str, model: str, spec: ProviderSpec) -> Dict[str, Any]:
+    from openai import OpenAI, BadRequestError, UnprocessableEntityError
 
-    client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=os.environ["OPENROUTER_API_KEY"])
+    client = OpenAI(base_url=spec.base_url, api_key=provider_api_key(spec))
     messages = [
         {"role": "system", "content": "You are MiniAVO AI, an expert GPU kernel architect. Respond with a single JSON object only."},
         {"role": "user", "content": prompt},
     ]
-    kwargs = dict(model=model, messages=messages, temperature=0.4, max_tokens=int(os.getenv("LIQUID_MAX_TOKENS", DEFAULT_MAX_TOKENS)),
-                  extra_headers={"X-Title": "MiniAVO-Liquid"},
-                  extra_body={"reasoning": {"effort": os.getenv("LIQUID_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)}})
-    try:
-        resp = client.chat.completions.create(response_format={"type": "json_object"}, **kwargs)
-    except BadRequestError as e:
-        # Some providers reject response_format; retry once without it
-        print(f"[!] json_object mode rejected ({e}); retrying without response_format")
-        resp = client.chat.completions.create(**kwargs)
+    max_tokens = int(os.getenv("LLM_MAX_TOKENS") or os.getenv("LIQUID_MAX_TOKENS") or spec.default_max_tokens)
+    kwargs: Dict[str, Any] = dict(model=model, messages=messages, temperature=0.4, max_tokens=max_tokens)
+    if spec.extra_headers:
+        kwargs["extra_headers"] = dict(spec.extra_headers)
+    effort = provider_reasoning_effort(spec)
+    if spec.reasoning_param == "openrouter":
+        kwargs["extra_body"] = {"reasoning": {"effort": effort}}
+    elif spec.reasoning_param == "openai":
+        kwargs["extra_body"] = {"reasoning_effort": effort}
+    # Drop the optional parts one at a time: some endpoints reject JSON mode, others the
+    # thinking-budget field. Only the last attempt is allowed to raise.
+    attempts = [("", dict(kwargs, response_format={"type": "json_object"})),
+                ("response_format", dict(kwargs))]
+    if "extra_body" in kwargs:
+        attempts.append(("extra_body", {k: v for k, v in kwargs.items() if k != "extra_body"}))
+    resp = None
+    for i, (dropped, attempt) in enumerate(attempts):
+        try:
+            resp = client.chat.completions.create(**attempt)
+            break
+        except (BadRequestError, UnprocessableEntityError) as e:
+            if i == len(attempts) - 1:
+                raise
+            print(f"[!] {spec.label} rejected {attempts[i + 1][0]} ({e}); retrying without it")
     usage = resp.usage
     if usage is not None:
         details = getattr(usage, "completion_tokens_details", None)
@@ -272,13 +419,22 @@ def mutate_kernel_with_agent(
     parent: KernelVariant,
     generation_idx: int,
     user_guidance: str = "",
-    model: str = DEFAULT_LIQUID_MODEL,
-    feedback: str = ""
+    model: str = "",
+    feedback: str = "",
+    provider: Optional[ProviderSpec] = None
 ) -> KernelVariant:
     agent_error = None
-    # If an OpenRouter API key is available, use the real Liquid AI agent mutation
-    if os.getenv("OPENROUTER_API_KEY"):
+    # With a usable provider key, mutate with the real LLM; otherwise fall through to the simulator
+    if provider is not None:
         try:
+            import gpu_bench
+            signature = gpu_bench.ENTRY_SIGNATURE.get(problem.id)
+            entry_requirement = (
+                f"The code must define a host wrapper `{signature}` that allocates the output and "
+                "launches the kernel with explicit BLOCK sizes and num_warps, so it can be compiled "
+                "and benchmarked as written." if signature else
+                "The code must define a host wrapper that allocates the output and launches the kernel "
+                "with explicit BLOCK sizes and num_warps.")
             prompt = f"""
             Target Hardware: {hw.name} ({hw.architecture}) with {hw.memory_bandwidth_gbs} GB/s bandwidth and {hw.peak_fp16_tflops} TFLOPS.
             Benchmark Problem: {problem.name}
@@ -293,6 +449,8 @@ def mutate_kernel_with_agent(
 
             {feedback}
 
+            {entry_requirement}
+
             Return a JSON response with:
             {{
               "variantName": "v{generation_idx}_<strategy_shortname>",
@@ -302,7 +460,7 @@ def mutate_kernel_with_agent(
               "code": "<Complete runnable Triton/CUDA Python code>"
             }}
             """
-            data = call_liquid_agent(prompt, model)
+            data = call_mutation_agent(prompt, model or provider_model(provider), provider)
 
             new_lat = float(data.get("estimatedLatencyUs", parent.latency_us * 0.78))
             if not (0 < new_lat < 1e7):
@@ -351,7 +509,7 @@ def mutate_kernel_with_agent(
             )
         except Exception as e:
             agent_error = str(e)
-            print(f"[!] Liquid agent ({model}) fallback to analytical engine: {e}")
+            print(f"[!] Mutation agent ({model} @ {provider.label}) fallback to analytical engine: {e}")
 
     # Deterministic Analytical Evolutionary Simulation fallback (no API key required)
     strat_idx = (generation_idx - 1) % len(MUTATION_STRATEGIES)
@@ -390,17 +548,44 @@ def analyze_kernel(code: str, problem: BenchmarkProblem, hw: HardwareProfile):
     return analyze(code, problem.id, hw.id, hw.shared_mem_per_sm_kb)
 
 def is_better(candidate: KernelVariant, elite: KernelVariant) -> bool:
-    """Elite selection by static score; falls back to the model's claimed speedup if Triton is unavailable."""
+    """Elite selection. A real timing beats the proxy: once the elite has one, only a candidate
+    that was also timed and came out faster can take its place, so an unbenchmarked generation
+    can never replace a measured elite with an unmeasured one. Without timings it is the static
+    score, or the model's claimed speedup if Triton is unavailable."""
+    if candidate.bench_status not in ("", "ok"):
+        return False  # the GPU harness rejected it: wrong result, crash or timeout
+    if elite.measured_latency_us is not None:
+        return (candidate.measured_latency_us is not None
+                and candidate.measured_latency_us < elite.measured_latency_us)
     if candidate.static_score is not None and elite.static_score is not None:
         return candidate.static_score > elite.static_score
     return candidate.speedup > elite.speedup
+
+
+def bench_on_gpu(variant: KernelVariant, problem: BenchmarkProblem, baseline_us: Optional[float],
+                 timeout_s: int) -> None:
+    """Time `variant` on the local GPU and record the result on it. Never raises."""
+    import gpu_bench
+    result = gpu_bench.bench_variant(variant.code, problem.id, timeout_s=timeout_s)
+    variant.bench_entry = result.get("entry")
+    if result.get("ok"):
+        variant.measured_latency_us = round(float(result["latency_us"]), 1)
+        variant.bench_status = "ok"
+        if baseline_us:
+            variant.measured_speedup = round(baseline_us / variant.measured_latency_us, 2)
+    else:
+        variant.bench_status = result.get("error", "unknown benchmark failure")
 
 # ---------------------------------------------------------------------------
 # 5. Main Evolutionary CLI Engine
 # ---------------------------------------------------------------------------
 
-def run_evolution_pipeline(problem_id: str, hardware_id: str, generations: int, steer_prompt: str = "", model: str = DEFAULT_LIQUID_MODEL,
-                           web_seed: bool = False, refresh_seed: bool = False, feedback_memory: str = "local"):
+def run_evolution_pipeline(problem_id: str, hardware_id: str, generations: int, steer_prompt: str = "", model: str = "",
+                           web_seed: bool = False, refresh_seed: bool = False, feedback_memory: str = "local",
+                           provider_id: str = "", gpu_bench_every: int = 0,
+                           gpu_bench_timeout: int = 300):
+    provider, provider_note = resolve_provider(provider_id)
+    model = model or (provider_model(provider) if provider else "")
     hw = HARDWARE_CATALOG.get(hardware_id, HARDWARE_CATALOG["b200"])
     problem = PROBLEMS.get(problem_id, PROBLEMS["matmul_v2"])
     seed_source = None
@@ -418,8 +603,15 @@ def run_evolution_pipeline(problem_id: str, hardware_id: str, generations: int, 
     print(f"  Peak Bandwidth  : {hw.memory_bandwidth_gbs} GB/s | Peak TFLOPS (FP16): {hw.peak_fp16_tflops}")
     print(f"  Benchmark Task  : {problem.name} [{problem.id}]")
     print(f"  Baseline Latency: {problem.baseline_latency_us} μs")
-    agent = model if os.getenv("OPENROUTER_API_KEY") else "analytical simulator (OPENROUTER_API_KEY not set)"
+    agent = f"{model} @ {provider.label}" if provider else f"analytical simulator ({provider_note})"
     print(f"  Mutation Agent  : {agent}")
+    if gpu_bench_every:
+        import gpu_bench
+        if not gpu_bench.supported(problem.id):
+            print(f"  GPU Benchmark   : disabled (no harness for {problem.id})")
+            gpu_bench_every = 0
+        else:
+            print(f"  GPU Benchmark   : every {gpu_bench_every} generation(s), {gpu_bench_timeout}s timeout")
     if steer_prompt:
         print(f"  Steering Prompt : \"{steer_prompt}\"")
     print("="*75 + "\n")
@@ -451,7 +643,10 @@ def run_evolution_pipeline(problem_id: str, hardware_id: str, generations: int, 
     from triton_check import HW_CAPABILITY
     from static_perf import GEMM_PROBLEMS
     store = None
-    if feedback_memory == "rawtree":
+    if feedback_memory == "file":
+        from local_store import LocalStore
+        store = LocalStore.from_env()
+    elif feedback_memory == "rawtree":
         from rawtree_store import RawTreeError, RawTreeStore
         try:
             store = RawTreeStore.from_env()
@@ -460,14 +655,28 @@ def run_evolution_pipeline(problem_id: str, hardware_id: str, generations: int, 
     feedback = Feedback(gemm=problem.id in GEMM_PROBLEMS, capability=HW_CAPABILITY.get(hw.id, 90), store=store,
                         context={"problem": problem.id, "hardware": hw.id, "model": model})
     if store is not None and store.enabled:
-        print(f"[*] Feedback memory: RawTree table '{store.table}' (run {store.run_id}), "
-              f"{feedback.loaded_from_memory} lesson(s) loaded from earlier runs\n")
+        print(f"[*] Feedback memory: {store.table} (run {store.run_id}), "
+              f"{feedback.loaded_from_memory} lesson(s) and {feedback.measured_from_memory} GPU "
+              f"measurement(s) loaded from earlier runs\n")
 
     print(f"[*] [Gen 0] Baseline Seed: {root_variant.name} | Reference latency: {root_variant.latency_us} μs (problem table)")
     if seed_error:
-        print(f"    └─ [!] Seed failed static analysis: {seed_error}\n")
+        print(f"    └─ [!] Seed failed static analysis: {seed_error}")
     else:
-        print(f"    └─ Static: {summarize(root_variant.static)}\n")
+        print(f"    └─ Static: {summarize(root_variant.static)}")
+    measured_baseline_us = None
+    if gpu_bench_every:
+        bench_on_gpu(root_variant, problem, None, gpu_bench_timeout)
+        if root_variant.bench_status == "ok":
+            measured_baseline_us = root_variant.measured_latency_us
+            root_variant.measured_speedup = 1.0
+            print(f"    └─ Measured: {measured_baseline_us} μs on {hw.name} "
+                  f"(entry {root_variant.bench_entry}, median of do_bench)")
+        else:
+            # Without a baseline timing, candidates are still timed and ranked against each other
+            print(f"    └─ [!] Seed not benchmarked: {root_variant.bench_status}")
+        feedback.observe_seed(root_variant)
+    print()
 
     for gen in range(1, generations + 1):
         print(f"[>] Evolving Generation {gen}/{generations} via Agentic Variation Operator...")
@@ -485,7 +694,8 @@ def run_evolution_pipeline(problem_id: str, hardware_id: str, generations: int, 
             generation_idx=gen,
             user_guidance=steer_prompt,
             model=model,
-            feedback=prompt_feedback
+            feedback=prompt_feedback,
+            provider=provider
         )
         lineage.append(new_variant)
         if new_variant.status == "failed":
@@ -495,6 +705,12 @@ def run_evolution_pipeline(problem_id: str, hardware_id: str, generations: int, 
             print(f"    │  Elite kept: {current_elite.name}\n")
             feedback.observe(new_variant, parent)
             continue
+        if gpu_bench_every and gen % gpu_bench_every == 0:
+            bench_on_gpu(new_variant, problem, measured_baseline_us, gpu_bench_timeout)
+            if new_variant.bench_status == "ok" and measured_baseline_us is None:
+                # First successful timing sets the reference the rest are compared against
+                measured_baseline_us = new_variant.measured_latency_us
+                new_variant.measured_speedup = 1.0
         if is_better(new_variant, current_elite):
             current_elite = new_variant
             new_variant.status = "elite"
@@ -508,7 +724,15 @@ def run_evolution_pipeline(problem_id: str, hardware_id: str, generations: int, 
         print(f"    │  Rationale : {new_variant.description}")
         print(f"    │  Static    : {summarize(new_variant.static)}")
         print(f"    │  Claimed   : {new_variant.latency_us} μs / {new_variant.speedup}x (model estimate, not measured)")
-        print(f"    │  Elite     : {current_elite.name} (score {current_elite.static_score})\n")
+        if new_variant.bench_status == "ok":
+            speedup = f" / {new_variant.measured_speedup}x vs baseline" if new_variant.measured_speedup else ""
+            print(f"    │  Measured  : {new_variant.measured_latency_us} μs on {hw.name}{speedup} "
+                  f"(entry {new_variant.bench_entry})")
+        elif new_variant.bench_status:
+            print(f"    │  Measured  : not timed — {new_variant.bench_status}")
+        elite_metric = (f"{current_elite.measured_latency_us} μs measured"
+                        if current_elite.measured_latency_us is not None else f"score {current_elite.static_score}")
+        print(f"    │  Elite     : {current_elite.name} ({elite_metric})\n")
 
     num_failed = sum(v.status == "failed" for v in lineage)
     print("="*75)
@@ -516,6 +740,13 @@ def run_evolution_pipeline(problem_id: str, hardware_id: str, generations: int, 
     print("="*75)
     print(f"  Static Score  : {current_elite.static_score}/100 (seed: {root_variant.static_score}/100, GPU-less proxy, not a timing)")
     print(f"  Claimed       : {current_elite.latency_us} μs / {current_elite.speedup}x (model estimate, not measured)")
+    if gpu_bench_every:
+        benched = [v for v in lineage if v.measured_latency_us is not None]
+        if current_elite.measured_latency_us is not None:
+            speedup = f" / {current_elite.measured_speedup}x vs seed" if current_elite.measured_speedup else ""
+            print(f"  Measured      : {current_elite.measured_latency_us} μs on {hw.name}{speedup}")
+        wrong = sum(1 for v in lineage if v.bench_status not in ("", "ok"))
+        print(f"  GPU Runs      : {len(benched)} timed, {wrong} rejected by the GPU harness")
     print(f"  Failed Checks : {num_failed}/{generations} generations rejected (syntax / Triton compile)")
     print("="*75)
 
@@ -543,15 +774,38 @@ if __name__ == "__main__":
     load_dotenv()
     parser = argparse.ArgumentParser(description="MiniAVO Autonomous GPU Kernel Evolutionary Pipeline")
     parser.add_argument("--problem", type=str, default="matmul_v2", choices=list(PROBLEMS.keys()), help="GPU MODE problem ID")
-    parser.add_argument("--hardware", type=str, default="b200", choices=list(HARDWARE_CATALOG.keys()), help="Target GPU hardware ID")
+    parser.add_argument("--hardware", type=str, default="b200", choices=list(HARDWARE_CATALOG.keys()),
+                        help="Target GPU hardware ID (use gb10 with --gpu-bench-every on the local DGX Spark)")
     parser.add_argument("--generations", type=int, default=5, help="Number of evolutionary generations to search")
-    parser.add_argument("--model", type=str, default=os.getenv("LIQUID_MODEL", DEFAULT_LIQUID_MODEL), help="OpenRouter model ID for the mutation agent")
+    parser.add_argument("--provider", type=str, default=os.getenv("LLM_PROVIDER", ""), choices=list(PROVIDERS),
+                        help="Inference provider for the mutation agent (default: whichever API key is set)")
+    parser.add_argument("--model", type=str, default="",
+                        help="Model ID for the mutation agent (default: the provider's own default)")
+    parser.add_argument("--list-models", nargs="?", const="", metavar="PROVIDER", default=None,
+                        help="Print the provider's model catalog and exit")
     parser.add_argument("--web-seed", action="store_true", help="Search the web (Nimble) for a better initial seed kernel")
     parser.add_argument("--refresh-seed", action="store_true", help="Ignore the cached web seed and search again")
-    parser.add_argument("--feedback-memory", choices=["local", "rawtree"], default=os.getenv("FEEDBACK_MEMORY", "local"),
-                        help="Where check-derived lessons are kept: this run only, or persisted in RawTree across runs")
+    parser.add_argument("--gpu-bench-every", type=int, default=int(os.getenv("GPU_BENCH_EVERY", "0")), metavar="N",
+                        help="Run every Nth generation on the local GPU: correctness against a torch "
+                             "reference, then a timing that outranks the static score (0 disables)")
+    parser.add_argument("--gpu-bench-timeout", type=int, default=300, metavar="SECONDS",
+                        help="Wall-clock limit for one GPU benchmark subprocess")
+    parser.add_argument("--feedback-memory", choices=["local", "file", "rawtree"],
+                        default=os.getenv("FEEDBACK_MEMORY", "local"),
+                        help="Where lessons and GPU measurements are kept: this run only (local), "
+                             "a JSONL file next to the script (file), or RawTree (rawtree)")
     parser.add_argument("--steer", type=str, default="", help="Natural language steering prompt for kernel mutations")
 
     args = parser.parse_args()
+    if args.list_models is not None:
+        pid = args.list_models or args.provider or PROVIDER_ORDER[0]
+        spec = PROVIDERS.get(pid)
+        if spec is None:
+            sys.exit(f"unknown provider {pid!r} (choices: {', '.join(PROVIDERS)})")
+        print(f"# {spec.label} ({spec.base_url}/models), default: {provider_model(spec)}")
+        for model_id in list_provider_models(spec):
+            print(model_id)
+        sys.exit(0)
     run_evolution_pipeline(args.problem, args.hardware, args.generations, args.steer, args.model,
-                           args.web_seed, args.refresh_seed, args.feedback_memory)
+                           args.web_seed, args.refresh_seed, args.feedback_memory, args.provider,
+                           args.gpu_bench_every, args.gpu_bench_timeout)

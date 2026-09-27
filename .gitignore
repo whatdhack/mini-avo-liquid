@@ -4,3 +4,4 @@ __pycache__/
 !.env.example
 evolution_result_*.json
 submission_*.py
+.miniavo_memory.jsonl

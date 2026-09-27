@@ -33,3 +33,19 @@ def matmul_kernel_naive(
 
     c_ptrs = c_ptr + (offs_am[:, None] * stride_cm + offs_bn[None, :] * stride_cn)
     tl.store(c_ptrs, accumulator)
+
+
+def solve(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Reference launch: untuned 64x64x32 tiles, no swizzling."""
+    M, K = a.shape
+    N = b.shape[1]
+    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+    BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = 64, 64, 32
+    grid = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+    matmul_kernel_naive[grid](
+        a, b, c, M, N, K,
+        a.stride(0), a.stride(1), b.stride(0), b.stride(1), c.stride(0), c.stride(1),
+        BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_K=BLOCK_SIZE_K,
+        num_warps=4,
+    )
+    return c

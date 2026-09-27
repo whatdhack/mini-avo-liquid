@@ -21,7 +21,9 @@ from typing import Any, Dict, Optional, Tuple
 from triton_check import HW_CAPABILITY, compile_entries
 
 # Problems dominated by tensor-core math vs. by memory bandwidth
-GEMM_PROBLEMS = {"matmul_v2", "trimul_alphafold3"}
+# Cholesky is scored GEMM-like: a fast implementation is blocked, and its trailing update is a
+# SYRK, so tensor cores and tile reuse are the right things to reward
+GEMM_PROBLEMS = {"matmul_v2", "trimul_alphafold3", "cholesky"}
 
 # Per-SM limits by compute capability: (max warps, max blocks); 64K registers on all of these
 SM_LIMITS = {80: (64, 32), 89: (48, 24), 90: (64, 32), 100: (64, 32)}
@@ -106,6 +108,24 @@ def _occupancy(regs: int, shared_bytes: int, num_warps: int, capability: int, sm
     return blocks, blocks * num_warps / max_warps
 
 
+# Registers per thread: the hardware cap is 255, and a kernel that lands there is not blocking
+# well, it is one allocation away from spilling. Credit peaks in the healthy band and falls to
+# zero at the cap. Measured on the GB10: the fastest 4096^3 GEMM found so far uses 226 registers
+# at 12% occupancy, which the occupancy term alone penalizes.
+REG_MAX = 255
+REG_BAND = (32, 96, 224)  # zero below the first, full between the middle and the third
+
+
+def _register_band(regs: int, spill_bytes: int) -> float:
+    if spill_bytes or regs < REG_BAND[0]:
+        return 0.0
+    if regs < REG_BAND[1]:
+        return (regs - REG_BAND[0]) / (REG_BAND[1] - REG_BAND[0])
+    if regs <= REG_BAND[2]:
+        return 1.0
+    return max(0.0, (REG_MAX - regs) / (REG_MAX - REG_BAND[2]))
+
+
 def _score(problem_id: str, capability: int, m: Dict[str, Any]) -> Dict[str, float]:
     """Weighted 0-100 score; component weights differ for GEMM-like vs memory-bound problems."""
     spill = max(0.0, 1.0 - m["spill_bytes"] / SPILL_BYTES_ZERO_SCORE)
@@ -118,18 +138,33 @@ def _score(problem_id: str, capability: int, m: Dict[str, Any]) -> Dict[str, flo
             reuse = min(1.0, 2.0 / (1.0 / m["tile_m"] + 1.0 / m["tile_n"]) / FULL_REUSE_TILE)
         else:
             reuse = 0.5  # tile sizes not identifiable from constexpr names
-        if capability >= 90:
-            # Hopper/Blackwell: TMA bulk-tensor copies beat per-thread cp.async, and warp-specialized
-            # producer/consumer partitions overlap TMA loads with tensor-core MMAs
+        registers = _register_band(m["registers"], m["spill_bytes"])
+        # Global atomics in a GEMM mean split-K accumulating into C. Measured on the GB10, every
+        # split-K variant landed in the slow tail (3196, 3498, 5135 us) while every non-atomic
+        # kernel came in at 2701 us or better.
+        no_atomics = 0.0 if m["atomics"] else 1.0
+        if capability >= 120:
+            # Consumer Blackwell (sm_121, GB10): measured, TMA and warp specialization buy nothing
+            # here. The fastest 4096^3 GEMM measured on this GPU uses neither and beats the best
+            # TMA + warp-specialized kernel by 7.6%, while the Hopper-style bonuses below scored it
+            # 77.5 against that kernel's 100. So there is no bonus for either on this target.
+            parts = {"tensor_cores": 20 * tensor, "tile_reuse": 25 * reuse, "load_width": 10 * load_width,
+                     "occupancy": 10 * occupancy, "no_spills": 15 * spill, "registers": 10 * registers,
+                     "no_atomics": 10 * no_atomics}
+        elif capability >= 90:
+            # Hopper/datacenter Blackwell: TMA bulk-tensor copies beat per-thread cp.async, and
+            # warp-specialized producer/consumer partitions overlap TMA loads with tensor-core MMAs
             staged = m["num_stages"] >= 2
             movement = 1.0 if m["tma"] else 0.5 if m["async_copy"] and staged else 0.0
             parts = {"tensor_cores": 20 * tensor, "tile_reuse": 15 * reuse, "load_width": 10 * load_width,
-                     "tma": 15 * movement, "warp_specialization": 15 * float(m["warp_specialized"]),
-                     "occupancy": 10 * occupancy, "no_spills": 15 * spill}
+                     "tma": 5 * movement, "warp_specialization": 5 * float(m["warp_specialized"]),
+                     "occupancy": 10 * occupancy, "no_spills": 15 * spill, "registers": 10 * registers,
+                     "no_atomics": 10 * no_atomics}
         else:
             pipelined = 1.0 if m["async_copy"] and m["num_stages"] >= 2 else 0.0
-            parts = {"tensor_cores": 25 * tensor, "tile_reuse": 20 * reuse, "load_width": 20 * load_width,
-                     "async_pipeline": 10 * pipelined, "occupancy": 10 * occupancy, "no_spills": 15 * spill}
+            parts = {"tensor_cores": 25 * tensor, "tile_reuse": 10 * reuse, "load_width": 15 * load_width,
+                     "async_pipeline": 10 * pipelined, "occupancy": 5 * occupancy, "no_spills": 15 * spill,
+                     "registers": 10 * registers, "no_atomics": 10 * no_atomics}
     else:
         occupancy = min(1.0, m["occupancy"] / 0.5)  # bandwidth-bound kernels need warps in flight
         parts = {"load_width": 50 * load_width, "occupancy": 30 * occupancy, "no_spills": 20 * spill}
