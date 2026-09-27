@@ -90,6 +90,42 @@ class RawTreeStore:
         """Append one event: kind is 'lesson' or 'candidate'; context holds problem/hardware/model."""
         self.insert([{"ts": time.time(), "run_id": self.run_id, "kind": kind, **context, **fields}])
 
+    def load_benchmarks(self, problem: str, hardware: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Real-GPU outcomes from earlier runs: the fastest timing per kernel name, plus the
+        kernels the GPU harness rejected. Fastest first, rejects last.
+
+        The rows are ranked in Python rather than with min()/ORDER BY, because
+        measured_latency_us is a dynamic column in a schemaless table: aggregating or comparing
+        it in SQL depends on the type RawTree inferred, and rows written before GPU benchmarking
+        existed do not have the key at all.
+        """
+        if not self.enabled:
+            return []
+        sql = (f"SELECT name, optimization_type, measured_latency_us, bench_status FROM {self.table} "
+               f"WHERE kind = 'candidate' AND problem = {sql_string(problem)} "
+               f"AND hardware = {sql_string(hardware)} AND run_id != {sql_string(self.run_id)} "
+               f"ORDER BY ts DESC LIMIT {int(limit) * 20}")
+        from local_store import rank_candidate_events
+        return rank_candidate_events(self._query_rows(sql, fatal=False), limit)
+
+    def _query_rows(self, sql: str, fatal: bool = True) -> List[Dict[str, Any]]:
+        """Rows for one query. `fatal=False` keeps a failing read from switching off the whole
+        memory backend: a query that cannot run is a reason to lose that one answer, not a
+        reason to stop recording lessons for the rest of the run."""
+        try:
+            _, result = self._request("/v1/query", {"sql": sql, "format": "JSON"})
+        except RawTreeError as e:
+            # A missing table or column just means no earlier run has written this yet
+            if "HTTP 404" in str(e) or "UNKNOWN_TABLE" in str(e) or "doesn't exist" in str(e) \
+                    or "UNKNOWN_IDENTIFIER" in str(e):
+                return []
+            if not fatal:
+                print(f"    [!] RawTree query failed, continuing without its result: {e}")
+                return []
+            self._disable(e)
+            return []
+        return (result or {}).get("data", [])
+
     def load_lessons(self, problem: str, hardware: str, limit: int = 20) -> List[Tuple[str, int]]:
         """(lesson, times seen) from earlier runs on this problem/hardware, oldest first."""
         if not self.enabled:
@@ -97,13 +133,5 @@ class RawTreeStore:
         sql = (f"SELECT lesson, count() AS n, max(ts) AS last_ts FROM {self.table} "
                f"WHERE kind = 'lesson' AND problem = {sql_string(problem)} AND hardware = {sql_string(hardware)} "
                f"GROUP BY lesson ORDER BY last_ts DESC LIMIT {int(limit)}")
-        try:
-            _, result = self._request("/v1/query", {"sql": sql, "format": "JSON"})
-        except RawTreeError as e:
-            # A missing table just means no earlier run has written feedback yet
-            if "HTTP 404" in str(e) or "UNKNOWN_TABLE" in str(e) or "doesn't exist" in str(e):
-                return []
-            self._disable(e)
-            return []
-        rows = (result or {}).get("data", [])
+        rows = self._query_rows(sql)
         return [(str(r["lesson"]), int(r["n"])) for r in reversed(rows) if r.get("lesson")]
